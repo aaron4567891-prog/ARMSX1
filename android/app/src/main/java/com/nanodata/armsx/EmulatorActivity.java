@@ -24,6 +24,8 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -35,6 +37,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class EmulatorActivity extends SDLActivity {
     static final String EXTRA_NATIVE_ARGS = "com.nanodata.armsx.EXTRA_NATIVE_ARGS";
@@ -43,6 +47,10 @@ public class EmulatorActivity extends SDLActivity {
     private static final String PREFS_NAME = "armsx_mobile_library";
     private static final String PREF_LIBRARY_ROOTS = "library_roots";
     private static final String VIRTUAL_PREFIX = "armsx-android:///";
+    private static final Pattern CUE_FILE_PATTERN = Pattern.compile(
+        "^\\s*FILE\\s+\"([^\"]+)\"",
+        Pattern.CASE_INSENSITIVE
+    );
 
     private static native void nativeEnqueueLaunchArgument(String argument);
     private static native void nativeSetPlatformLibrarySnapshot(
@@ -227,6 +235,120 @@ public class EmulatorActivity extends SDLActivity {
         } catch (IOException | SecurityException error) {
             Log.e(TAG, "Unable to open " + virtualPath, error);
             return -1;
+        }
+    }
+
+    /**
+     * Creates a real filesystem view of a Storage Access Framework document.
+     * libchdr opens CHDs by path rather than through psxe_platform_fopen(), so a
+     * content URI (and ARMSX's virtual URI) cannot be passed to it directly.
+     * CUE files are staged with every FILE companion for the same reason and to
+     * preserve the relative paths used by multi-track dumps.
+     */
+    public String materializeVirtualDisc(String virtualPath) {
+        final Map<String, String> uriSnapshot;
+        synchronized (libraryLock) {
+            if (!virtualFileUris.containsKey(virtualPath)) {
+                Log.e(TAG, "No document URI mapped for disc " + virtualPath);
+                return null;
+            }
+            uriSnapshot = new HashMap<>(virtualFileUris);
+        }
+
+        File launchRoot = new File(getCacheDir(), "saf-launch");
+        File sessionDirectory = new File(launchRoot, stableKey(virtualPath));
+        if (!sessionDirectory.exists() && !sessionDirectory.mkdirs()) {
+            Log.e(TAG, "Unable to create SAF launch directory " + sessionDirectory);
+            return null;
+        }
+
+        String fileName = virtualPath.substring(virtualPath.lastIndexOf('/') + 1);
+        File localDisc = new File(sessionDirectory, fileName);
+        try {
+            copyDocument(uriSnapshot.get(virtualPath), localDisc);
+            if (fileName.toLowerCase(Locale.ROOT).endsWith(".cue")) {
+                copyCueCompanions(virtualPath, localDisc, sessionDirectory, uriSnapshot);
+            }
+            Log.i(TAG, "Materialized SAF disc at " + localDisc);
+            return localDisc.getAbsolutePath();
+        } catch (IOException | SecurityException error) {
+            Log.e(TAG, "Unable to materialize SAF disc " + virtualPath, error);
+            return null;
+        }
+    }
+
+    private void copyCueCompanions(
+        String cueVirtualPath,
+        File localCue,
+        File sessionDirectory,
+        Map<String, String> uriSnapshot
+    ) throws IOException {
+        String cueParent = parentVirtualPath(cueVirtualPath);
+        try (BufferedReader reader = new BufferedReader(
+            new InputStreamReader(new java.io.FileInputStream(localCue), StandardCharsets.UTF_8)
+        )) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                Matcher matcher = CUE_FILE_PATTERN.matcher(line);
+                if (!matcher.find()) {
+                    continue;
+                }
+
+                String relativeName = matcher.group(1).replace('\\', '/');
+                if (relativeName.startsWith("/") || relativeName.contains("../")) {
+                    throw new IOException("Unsafe CUE companion path: " + relativeName);
+                }
+                String companionVirtualPath = cueParent + "/" + relativeName;
+                String companionUri = uriSnapshot.get(companionVirtualPath);
+                if (companionUri == null) {
+                    companionUri = findVirtualPathIgnoringCase(uriSnapshot, companionVirtualPath);
+                }
+                if (companionUri == null) {
+                    throw new IOException("CUE companion is not accessible: " + relativeName);
+                }
+
+                File companion = new File(sessionDirectory, relativeName);
+                String rootPath = sessionDirectory.getCanonicalPath() + File.separator;
+                if (!companion.getCanonicalPath().startsWith(rootPath)) {
+                    throw new IOException("CUE companion escapes launch directory: " + relativeName);
+                }
+                copyDocument(companionUri, companion);
+            }
+        }
+    }
+
+    private static String findVirtualPathIgnoringCase(Map<String, String> files, String wanted) {
+        for (Map.Entry<String, String> entry : files.entrySet()) {
+            if (entry.getKey().equalsIgnoreCase(wanted)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    private void copyDocument(String uriText, File destination) throws IOException {
+        File parent = destination.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("Unable to create " + parent);
+        }
+        File temporary = new File(destination.getPath() + ".part");
+        try (InputStream input = getContentResolver().openInputStream(Uri.parse(uriText));
+             FileOutputStream output = new FileOutputStream(temporary)) {
+            if (input == null) {
+                throw new IOException("Document provider returned no stream for " + uriText);
+            }
+            byte[] buffer = new byte[256 * 1024];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                output.write(buffer, 0, read);
+            }
+            output.getFD().sync();
+        }
+        if (destination.exists() && !destination.delete()) {
+            throw new IOException("Unable to replace " + destination);
+        }
+        if (!temporary.renameTo(destination)) {
+            throw new IOException("Unable to finish writing " + destination);
         }
     }
 

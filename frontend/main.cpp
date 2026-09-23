@@ -497,6 +497,49 @@ FILE* AndroidPlatformFopen(const char* path, const char* mode, void*) {
     }
     return file;
 }
+
+std::optional<std::filesystem::path> MaterializeAndroidVirtualDisc(std::string_view path) {
+    if (!IsAndroidVirtualPath(path)) {
+        return std::filesystem::path(path);
+    }
+
+    JNIEnv* env = static_cast<JNIEnv*>(SDL_AndroidGetJNIEnv());
+    jobject activity = static_cast<jobject>(SDL_AndroidGetActivity());
+    if (!env || !activity) {
+        return std::nullopt;
+    }
+
+    std::optional<std::filesystem::path> result;
+    jclass cls = env->GetObjectClass(activity);
+    jmethodID method = cls
+        ? env->GetMethodID(cls, "materializeVirtualDisc", "(Ljava/lang/String;)Ljava/lang/String;")
+        : nullptr;
+    if (method) {
+        jstring source = env->NewStringUTF(std::string(path).c_str());
+        auto local = static_cast<jstring>(env->CallObjectMethod(activity, method, source));
+        env->DeleteLocalRef(source);
+        if (!env->ExceptionCheck() && local) {
+            const char* chars = env->GetStringUTFChars(local, nullptr);
+            if (chars) {
+                result = std::filesystem::path(chars);
+                env->ReleaseStringUTFChars(local, chars);
+            }
+            env->DeleteLocalRef(local);
+        }
+    } else {
+        env->ExceptionClear();
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        result.reset();
+    }
+    if (cls) {
+        env->DeleteLocalRef(cls);
+    }
+    env->DeleteLocalRef(activity);
+    return result;
+}
 #endif
 
 bool RequestPlatformLibraryDirectory(bool recursive) {
@@ -4978,7 +5021,21 @@ class ArmsxApp {
             request.path.empty() ? "(none)" : request.path.string().c_str(),
             close_ui ? "true" : "false");
 
-        if (!session_.create(renderer_, settings_, request, error)) {
+        LaunchRequest effective_request = request;
+#if defined(__ANDROID__)
+        if (request.kind == LaunchKind::Disc && IsAndroidVirtualPath(request.path.string())) {
+            const auto local_path = MaterializeAndroidVirtualDisc(request.path.string());
+            if (!local_path) {
+                pending_error_dialog_ = "Failed to copy the selected disc from Android storage. Check that the folder permission is still granted and every CUE track file is present.";
+                psxe_diag_logf("launch", "Android SAF disc materialization failed path=%s", request.path.string().c_str());
+                showGameListWindow();
+                return false;
+            }
+            effective_request.path = *local_path;
+        }
+#endif
+
+        if (!session_.create(renderer_, settings_, effective_request, error)) {
             pending_error_dialog_ = error;
             psxe_diag_logf("launch", "Session launch failed kind=%s error=%s", LaunchKindTitle(request.kind), error.c_str());
             if (request.kind == LaunchKind::Bios) {
